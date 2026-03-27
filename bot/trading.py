@@ -67,9 +67,11 @@ class TradingEngine:
         # Find matching score state
         score = self._find_score(market_id, scores)
 
-        # Log odds tape for dry-run analysis (every tick, every market)
+        # Log odds tape and model tape for dry-run analysis
         if self.signal_logger:
             self.signal_logger.log_odds_tick(market_id, market, score)
+            if score and score.is_fresh:
+                self.signal_logger.log_model_tick(market_id, score)
 
         # Check exit conditions for open position
         if market_id in self.positions.positions:

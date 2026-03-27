@@ -1,16 +1,17 @@
 """Signal logger for dry-run edge validation.
 
-In dry-run mode, logs two streams of data:
+In dry-run mode, logs three streams of data:
 
 1. signals.jsonl — every time the model detects a potential edge, logged with
    timestamp, model odds, market odds, score state, and what the bot WOULD do.
 
 2. odds_tape.jsonl — continuous log of market odds + model odds for every
-   active match on every odds tick. This is the raw tape used by the analysis
-   script to check what happened AFTER each signal.
+   active match on every odds tick (delayed Betfair data).
 
-Together these let you answer: "If I had placed this trade at this moment,
-what would the market odds have been 5/10/30/60 seconds later?"
+3. model_tape.jsonl — model odds + score state saved every second for each
+   active match. This is the SOURCE OF TRUTH for what the model calculated.
+   After the match, this is merged with real Betfair historical data
+   (not delayed) to find true edges.
 """
 
 from __future__ import annotations
@@ -30,19 +31,22 @@ log = logging.getLogger(__name__)
 
 SIGNALS_FILE = Path("data/signals.jsonl")
 ODDS_TAPE_FILE = Path("data/odds_tape.jsonl")
+MODEL_TAPE_FILE = Path("data/model_tape.jsonl")
 
 # Throttle odds tape: max one write per market per N seconds
 TAPE_INTERVAL = 1.0
 
 
 class SignalLogger:
-    """Logs signals and continuous odds tape for post-hoc edge analysis."""
+    """Logs signals, odds tape, and model tape for post-hoc edge analysis."""
 
     def __init__(self) -> None:
         SIGNALS_FILE.parent.mkdir(parents=True, exist_ok=True)
         self._last_tape_write: dict[str, float] = {}  # market_id -> timestamp
+        self._last_model_write: dict[str, float] = {}  # market_id -> timestamp
         self._signal_count = 0
         self._tape_count = 0
+        self._model_count = 0
 
     def log_signal(
         self,
@@ -163,6 +167,54 @@ class SignalLogger:
         self._tape_count += 1
         self._append(ODDS_TAPE_FILE, entry)
 
+    def log_model_tick(
+        self,
+        market_id: str,
+        score: ScoreState,
+    ) -> None:
+        """Log model odds + score state every second per market.
+
+        This is independent of Betfair market data — purely what the model
+        thinks at each moment. After the match, this tape is merged with
+        real (non-delayed) Betfair historical data to find true edges.
+        """
+        now = time.time()
+        last = self._last_model_write.get(market_id, 0)
+        if now - last < TAPE_INTERVAL:
+            return
+        self._last_model_write[market_id] = now
+
+        if not score.is_fresh or not score.player1_selection_id:
+            return
+
+        try:
+            model_prob_p1, model_odds_p1 = calculate_player1_win_prob(score)
+        except Exception:
+            return
+
+        entry = {
+            "type": "model",
+            "unix_ts": round(now, 3),
+            "market_id": market_id,
+            "selection_id": score.player1_selection_id,
+            "player1": score.player1_name,
+            "player2": score.player2_name,
+            "tournament": score.tournament,
+            "surface": score.surface,
+            "model_odds_p1": round(model_odds_p1, 4),
+            "model_prob_p1": round(model_prob_p1, 4),
+            "point_score": list(score.point_score),
+            "game_score": list(score.game_score),
+            "set_score": list(score.set_score),
+            "server": score.server,
+            "p1_serve_pct": round(score.player1_serve_pct, 4),
+            "p2_serve_pct": round(score.player2_serve_pct, 4),
+            "score_age_sec": round(score.age_seconds, 1),
+        }
+
+        self._model_count += 1
+        self._append(MODEL_TAPE_FILE, entry)
+
     def _append(self, path: Path, data: dict) -> None:
         try:
             with open(path, "a") as f:
@@ -172,4 +224,8 @@ class SignalLogger:
 
     @property
     def stats(self) -> dict[str, int]:
-        return {"signals": self._signal_count, "tape_ticks": self._tape_count}
+        return {
+            "signals": self._signal_count,
+            "tape_ticks": self._tape_count,
+            "model_ticks": self._model_count,
+        }

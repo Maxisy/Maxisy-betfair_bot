@@ -305,33 +305,37 @@ class PositionTracker:
         return None
 
     def _ticks_against(self, pos: Position, current_price: float) -> int:
-        """How many ticks the position has moved against us."""
+        """How many ticks the position has moved against us.
+
+        BACK at 1.95: odds RISING to 2.05 = against (must lay higher to close).
+        LAY at 1.95: odds DROPPING to 1.85 = against (must back lower to close).
+        """
         if pos.side == Side.BACK:
-            # Backed high, need price to stay high or go higher. Lower = against.
-            return max(0, ticks_between(current_price, pos.entry_odds))
-        else:
-            # Laid low, need price to stay low or go lower. Higher = against.
             return max(0, ticks_between(pos.entry_odds, current_price))
+        else:
+            return max(0, ticks_between(current_price, pos.entry_odds))
 
     def _ticks_for(self, pos: Position, current_price: float) -> int:
-        """How many ticks the position has moved in our favour."""
+        """How many ticks the position has moved in our favour.
+
+        BACK at 1.95: odds DROPPING to 1.85 = profit (lay cheaper to close).
+        LAY at 1.95: odds RISING to 2.05 = profit (back cheaper to close).
+        """
         if pos.side == Side.BACK:
-            # Backed: higher current price = profit
-            return max(0, ticks_between(pos.entry_odds, current_price))
-        else:
-            # Laid: lower current price = profit
             return max(0, ticks_between(current_price, pos.entry_odds))
+        else:
+            return max(0, ticks_between(pos.entry_odds, current_price))
 
     def _calc_gross_profit(self, pos: Position, exit_price: float) -> float:
-        """Calculate gross profit for a closed position."""
+        """Calculate gross profit for a closed position.
+
+        BACK at entry, LAY to close: profit = stake * (entry - exit) / entry
+        LAY at entry, BACK to close: profit = stake * (exit - entry) / entry
+        """
         if pos.side == Side.BACK:
-            # Backed at entry, laid at exit
-            # Profit = stake * (exit_odds - entry_odds) / entry_odds (approx)
-            # More precisely: backed at entry_odds, then lay at exit_odds
-            return pos.stake * (exit_price - pos.entry_odds) / pos.entry_odds
-        else:
-            # Laid at entry, backed at exit
             return pos.stake * (pos.entry_odds - exit_price) / pos.entry_odds
+        else:
+            return pos.stake * (exit_price - pos.entry_odds) / pos.entry_odds
 
     # ------------------------------------------------------------------
     # Reconciliation
