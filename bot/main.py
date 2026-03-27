@@ -94,7 +94,7 @@ class Bot:
         # Enable signal logger in paper/dry-run mode
         if self.config.is_paper:
             self.engine.signal_logger = SignalLogger()
-            log.info("Signal logger enabled — writing to data/signals.jsonl and data/odds_tape.jsonl")
+            log.info("Signal logger enabled — writing to data/model_tape.jsonl")
 
         # --- Start services ---
         await self.client.start()

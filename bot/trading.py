@@ -67,11 +67,9 @@ class TradingEngine:
         # Find matching score state
         score = self._find_score(market_id, scores)
 
-        # Log odds tape and model tape for dry-run analysis
-        if self.signal_logger:
-            self.signal_logger.log_odds_tick(market_id, market, score)
-            if score and score.is_fresh:
-                self.signal_logger.log_model_tick(market_id, score)
+        # Log model tape for post-match backtesting
+        if self.signal_logger and score and score.is_fresh:
+            self.signal_logger.log_model_tick(market_id, score)
 
         # Check exit conditions for open position
         if market_id in self.positions.positions:
@@ -167,21 +165,6 @@ class TradingEngine:
         if not approved:
             log.debug("Trade rejected by risk: %s", reject_reason)
             return
-
-        # Log signal for dry-run analysis (before placing order)
-        if self.signal_logger:
-            self.signal_logger.log_signal(
-                market_id=market_id,
-                market=market,
-                score=score,
-                selection_id=sel_id,
-                side=side.value,
-                model_odds=p1_model_odds,
-                market_odds=market_odds,
-                edge=edge,
-                best_back=runner.best_back_price,
-                best_lay=runner.best_lay_price,
-            )
 
         # Step 8: Place limit order
         score_str = (
