@@ -1,0 +1,11 @@
+.env
+certs/
+*.pem
+*.crt
+*.key
+__pycache__/
+*.pyc
+trades.jsonl
+logs/
+data/serve_stats.json
+.venv/

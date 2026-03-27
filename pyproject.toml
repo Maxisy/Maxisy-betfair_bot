@@ -1,0 +1,14 @@
+[project]
+name = "betfair-tennis-scalper"
+version = "0.1.0"
+description = "Tennis scalping bot for Betfair Exchange using Goalserve data"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.9",
+    "python-dotenv>=1.0",
+    "beautifulsoup4>=4.12",
+    "unidecode>=1.3",
+]
+
+[project.scripts]
+scalper = "bot.main:main"
