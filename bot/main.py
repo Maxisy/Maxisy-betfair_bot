@@ -28,6 +28,7 @@ from .market_filter import MarketFilter
 from .matcher import map_matches_to_markets
 from .models import ExitReason, MarketState, Position, ScoreState
 from .positions import PositionTracker
+from .signal_logger import SignalLogger
 from .risk import RiskManager
 from .serve_stats import ServeStatsLoader
 from .stream import BetfairStream, PaperBetfairStream
@@ -89,6 +90,11 @@ class Bot:
         # Wire up callbacks
         self.engine.on_trade_closed = self._on_trade_closed
         self.engine.on_alert = self._on_alert
+
+        # Enable signal logger in paper/dry-run mode
+        if self.config.is_paper:
+            self.engine.signal_logger = SignalLogger()
+            log.info("Signal logger enabled — writing to data/signals.jsonl and data/odds_tape.jsonl")
 
         # --- Start services ---
         await self.client.start()

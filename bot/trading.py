@@ -23,6 +23,7 @@ from .models import (
 from .positions import PositionTracker
 from .probability import calculate_model_odds, calculate_player1_win_prob
 from .risk import RiskManager
+from .signal_logger import SignalLogger
 from .ticks import nearest_tick
 
 log = logging.getLogger(__name__)
@@ -43,6 +44,9 @@ class TradingEngine:
         self.risk = risk
         self.market_filter = market_filter
 
+        # Signal logger for dry-run edge validation
+        self.signal_logger: Optional[SignalLogger] = None
+
         # Callback for logging trades
         self.on_trade_closed: Optional[callable] = None
         # Callback for alerts
@@ -62,6 +66,10 @@ class TradingEngine:
 
         # Find matching score state
         score = self._find_score(market_id, scores)
+
+        # Log odds tape for dry-run analysis (every tick, every market)
+        if self.signal_logger:
+            self.signal_logger.log_odds_tick(market_id, market, score)
 
         # Check exit conditions for open position
         if market_id in self.positions.positions:
@@ -157,6 +165,21 @@ class TradingEngine:
         if not approved:
             log.debug("Trade rejected by risk: %s", reject_reason)
             return
+
+        # Log signal for dry-run analysis (before placing order)
+        if self.signal_logger:
+            self.signal_logger.log_signal(
+                market_id=market_id,
+                market=market,
+                score=score,
+                selection_id=sel_id,
+                side=side.value,
+                model_odds=p1_model_odds,
+                market_odds=market_odds,
+                edge=edge,
+                best_back=runner.best_back_price,
+                best_lay=runner.best_lay_price,
+            )
 
         # Step 8: Place limit order
         score_str = (
