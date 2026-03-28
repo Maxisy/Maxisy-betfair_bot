@@ -212,33 +212,43 @@ def calculate_model_odds(state: ScoreState) -> tuple[float, float]:
     p_serve = state.server_serve_pct
     p_return_serve = state.receiver_serve_pct  # other player's serve %
 
-    # Layer 2: probability server wins current game
-    g = prob_win_game(p_serve, state.point_score[0], state.point_score[1])
-
-    # Layer 3: probability server wins current set from current game score
-    # We need to handle the current game being in progress.
-    # First get prob of winning set assuming current game is won or lost,
-    # weighted by prob of winning current game.
     sg, rg = state.game_score
 
-    # If server wins this game → (sg+1, rg), service switches
-    if sg + 1 >= 6 and (sg + 1) - rg >= 2:
-        p_set_after_hold = 1.0
-    elif sg + 1 == 6 and rg == 6:
-        p_set_after_hold = prob_win_tiebreak(p_serve, p_return_serve, 0, 0)
+    if state.is_tiebreak:
+        # In a tiebreak: point_score is actual tiebreak points (0,1,2,...),
+        # and game_score should be 6-6. Use tiebreak probability directly.
+        g = prob_win_tiebreak(
+            p_serve, p_return_serve,
+            state.point_score[0], state.point_score[1],
+        )
+        # Tiebreak winner takes the set
+        p_set = g
     else:
-        p_set_after_hold = 1.0 - prob_win_set(p_return_serve, p_serve, rg, sg + 1)
+        # Layer 2: probability server wins current game
+        g = prob_win_game(p_serve, state.point_score[0], state.point_score[1])
 
-    # If server loses this game → (sg, rg+1), service switches
-    if rg + 1 >= 6 and (rg + 1) - sg >= 2:
-        p_set_after_break = 0.0
-    elif rg + 1 == 6 and sg == 6:
-        p_set_after_break = prob_win_tiebreak(p_return_serve, p_serve, 0, 0)
-        p_set_after_break = 1.0 - p_set_after_break
-    else:
-        p_set_after_break = 1.0 - prob_win_set(p_return_serve, p_serve, rg + 1, sg)
+        # Layer 3: probability server wins current set from current game score
+        # First get prob of winning set assuming current game is won or lost,
+        # weighted by prob of winning current game.
 
-    p_set = g * p_set_after_hold + (1 - g) * p_set_after_break
+        # If server wins this game → (sg+1, rg), service switches
+        if sg + 1 >= 6 and (sg + 1) - rg >= 2:
+            p_set_after_hold = 1.0
+        elif sg + 1 == 6 and rg == 6:
+            p_set_after_hold = prob_win_tiebreak(p_serve, p_return_serve, 0, 0)
+        else:
+            p_set_after_hold = 1.0 - prob_win_set(p_return_serve, p_serve, rg, sg + 1)
+
+        # If server loses this game → (sg, rg+1), service switches
+        if rg + 1 >= 6 and (rg + 1) - sg >= 2:
+            p_set_after_break = 0.0
+        elif rg + 1 == 6 and sg == 6:
+            p_set_after_break = prob_win_tiebreak(p_return_serve, p_serve, 0, 0)
+            p_set_after_break = 1.0 - p_set_after_break
+        else:
+            p_set_after_break = 1.0 - prob_win_set(p_return_serve, p_serve, rg + 1, sg)
+
+        p_set = g * p_set_after_hold + (1 - g) * p_set_after_break
 
     # Layer 4: probability server wins match from current set score
     sets_to_win = 2 if state.best_of == 3 else 3

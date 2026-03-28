@@ -57,6 +57,8 @@ class ScoreState:
     scheduled_start: float = 0.0
     # Track points played in current game for new-game filter
     points_in_current_game: int = 0
+    # True when the current game is a tiebreak (from Goalserve tb flag)
+    is_tiebreak: bool = False
 
     @property
     def is_fresh(self) -> bool:
