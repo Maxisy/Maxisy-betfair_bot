@@ -69,9 +69,10 @@ class Config:
     entry_fill_timeout: float = 5.0
     exit_fill_timeout: float = 10.0
 
-    # Surface defaults for serve win %
+    # Surface defaults for serve win % — conservative estimates
+    # Blended ATP/WTA/Challenger/ITF averages (not top-ATP which is ~65%)
     surface_defaults: dict[str, float] = field(
-        default_factory=lambda: {"hard": 0.63, "clay": 0.60, "grass": 0.65}
+        default_factory=lambda: {"hard": 0.58, "clay": 0.55, "grass": 0.60}
     )
 
     # Allowed tournament tiers (keywords to match in tournament name)
@@ -112,6 +113,8 @@ class Config:
             "WTA 1000",
             " MD",            # Doubles (e.g. "ATP Marrakech MD")
             " WD",            # Women's Doubles
+            "Doubles",        # Catch-all for doubles variants
+            " XD",            # Mixed Doubles
         ]
     )
 
