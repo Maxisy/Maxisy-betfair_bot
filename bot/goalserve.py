@@ -1,19 +1,22 @@
-"""Goalserve Tennis API poller and score state manager.
+"""Goalserve inplay feed poller and score state manager.
 
-Two-tier polling strategy for minimal latency:
+Uses the inplay tennis feed (IP-whitelisted, no API key in URL):
+  http://inplay.goalserve.com/inplay-tennis.gz
 
-1. Discovery poll (every 30s) — hits the full livescore feed to find new
-   live matches and their IDs:
-     /tennis_scores/home?json=1
+Single HTTP request returns all live tennis matches with scores, stats,
+and serve info. Refreshes every second on Goalserve's side. We poll
+every 1s to match. Response is ~200ms, scores are ~10% of payload
+(rest is bookmaker odds we discard).
 
-2. Fast poll (every 5s) — hits individual match endpoints for matches we
-   are actively tracking:
-     /tennis_scores/match?id=978179&json=1
+Surface data is not in the inplay feed, so we periodically fetch the
+score feed to build a tournament→surface lookup:
+  https://www.goalserve.com/getfeed/{key}/tennis_scores/home?json=1
 
-This keeps the fast-path response tiny (single match) instead of parsing
-the entire day's tournament data on every cycle.
-
-Docs reference: Goalserve Tennis Data Feed, Section 4 (Livescore Feed).
+State codes (from /dictionaries/states/tennis):
+  11113 = Player 1 Serve
+  21113 = Player 2 Serve
+  11125 = Player 1 Score Point in Tiebreak
+  21125 = Player 2 Score Point in Tiebreak
 """
 
 from __future__ import annotations
@@ -30,36 +33,34 @@ from .models import ScoreSource, ScoreState
 
 log = logging.getLogger(__name__)
 
-GOALSERVE_BASE = "https://www.goalserve.com/getfeed"
-FAST_POLL_INTERVAL = 5.0
-DISCOVERY_INTERVAL = 30.0
+INPLAY_URL = "http://inplay.goalserve.com/inplay-tennis.gz"
+SCORE_FEED_URL = "https://www.goalserve.com/getfeed/{key}/tennis_scores/home"
+POLL_INTERVAL = 1.0
+SURFACE_REFRESH_INTERVAL = 300.0  # refresh surface map every 5 minutes
 
-# Live match statuses per Goalserve docs
-LIVE_STATUSES = {"set 1", "set 2", "set 3", "set 4", "set 5"}
-
-
-def _g(obj: dict, key: str, default: Any = "") -> Any:
-    """Get a value from a Goalserve JSON object.
-
-    Goalserve XML-to-JSON conversion may prefix attribute keys with '@'.
-    Try both variants.
-    """
-    return obj.get(f"@{key}", obj.get(key, default))
-
-
-def _ensure_list(val: Any) -> list:
-    """Goalserve returns a dict when there's one item, list when multiple."""
-    if val is None:
-        return []
-    if isinstance(val, dict):
-        return [val]
-    if isinstance(val, list):
-        return val
-    return []
+# State codes where a player is serving (normal game)
+SERVE_STATES = {11113, 21113}
+# State codes for tiebreak activity
+TIEBREAK_STATES = {11125, 21125}
+# All "live play" states (serve, point scored, tiebreak, etc.)
+LIVE_STATES = {
+    11113, 21113,  # serve
+    11114, 21114,  # score point
+    11115, 21115,  # score point (variant)
+    11116, 21116,  # double fault
+    11117, 21117,  # ace
+    11118, 21118,  # break point
+    11119, 21119,  # win a game
+    11120, 21120,  # statistic
+    11121, 21121,  # let 1st serve
+    11122, 21122,  # let 2nd serve
+    11125, 21125,  # tiebreak point
+    11128, 21128,  # point score
+}
 
 
 class GoalservePoller:
-    """Polls Goalserve Tennis Livescore Feed for live score data."""
+    """Polls Goalserve inplay tennis feed for live score data."""
 
     def __init__(
         self,
@@ -74,8 +75,9 @@ class GoalservePoller:
         # match_id -> ScoreState
         self.scores: dict[str, ScoreState] = {}
 
-        # Match IDs we're actively fast-polling
-        self._tracked_ids: set[str] = set()
+        # Tournament name -> surface (from score feed)
+        self._surface_map: dict[str, str] = {}
+        self._surface_last_refresh: float = 0.0
 
         # Health tracking
         self.last_success: float = 0.0
@@ -85,17 +87,31 @@ class GoalservePoller:
     async def start(self) -> None:
         self._session = aiohttp.ClientSession()
         self._running = True
-        log.info("Goalserve poller started (discovery=%.0fs, fast=%.0fs)",
-                 DISCOVERY_INTERVAL, FAST_POLL_INTERVAL)
+        log.info("Goalserve inplay poller started (interval=%.0fs)", POLL_INTERVAL)
 
-        # Run discovery and fast poll as concurrent tasks
-        discovery_task = asyncio.create_task(
-            self._discovery_loop(), name="gs_discovery",
-        )
-        fast_task = asyncio.create_task(
-            self._fast_poll_loop(), name="gs_fast",
-        )
-        await asyncio.gather(discovery_task, fast_task)
+        # Initial surface map fetch
+        await self._refresh_surface_map()
+
+        while self._running:
+            try:
+                await self._poll()
+                self.consecutive_failures = 0
+                self.last_success = time.time()
+                if self.is_degraded:
+                    log.info("Goalserve recovered from degraded state")
+                    self.is_degraded = False
+            except Exception as e:
+                self.consecutive_failures += 1
+                log.error("Goalserve poll failed (#%d): %s",
+                          self.consecutive_failures, e)
+                if self.consecutive_failures >= 3:
+                    self.is_degraded = True
+
+            # Periodically refresh surface map
+            if time.time() - self._surface_last_refresh > SURFACE_REFRESH_INTERVAL:
+                await self._refresh_surface_map()
+
+            await asyncio.sleep(POLL_INTERVAL)
 
     async def stop(self) -> None:
         self._running = False
@@ -109,50 +125,17 @@ class GoalservePoller:
             return float("inf")
         return time.time() - self.last_success
 
-    # ------------------------------------------------------------------
-    # Discovery loop — find new live matches
-    # ------------------------------------------------------------------
-
-    async def _discovery_loop(self) -> None:
-        """Poll full livescore feed to discover new live matches."""
-        while self._running:
-            try:
-                await self._poll_all()
-                self._record_success()
-            except Exception as e:
-                self._record_failure(e, "discovery")
-            await asyncio.sleep(DISCOVERY_INTERVAL)
-
-    async def _poll_all(self) -> None:
-        """Fetch full livescore feed and discover/update all live matches."""
+    async def _poll(self) -> None:
         assert self._session is not None
-        url = f"{GOALSERVE_BASE}/{self.config.goalserve_api_key}/tennis_scores/home"
-        params = {"json": "1"}
 
         async with self._session.get(
-            url, params=params, timeout=aiohttp.ClientTimeout(total=15),
+            INPLAY_URL, timeout=aiohttp.ClientTimeout(total=5),
         ) as resp:
-            if resp.status == 429:
-                log.warning("Goalserve rate limited (discovery) — backing off 30s")
-                await asyncio.sleep(30)
-                return
-            if resp.status >= 500:
-                raise RuntimeError(f"Goalserve server error: {resp.status}")
-            resp.raise_for_status()
+            if resp.status != 200:
+                raise RuntimeError(f"Goalserve inplay error: {resp.status}")
             data = await resp.json(content_type=None)
 
-        live_ids = self._parse_full_feed(data)
-
-        # Update tracked set — add new live matches, remove finished ones
-        new_ids = live_ids - self._tracked_ids
-        gone_ids = self._tracked_ids - live_ids
-        if new_ids:
-            log.info("Discovered %d new live match(es): %s", len(new_ids), new_ids)
-        self._tracked_ids = live_ids
-
-        # Clean up finished matches
-        for mid in gone_ids:
-            self.scores.pop(mid, None)
+        self._parse_feed(data)
 
         if self._on_scores_updated:
             try:
@@ -160,232 +143,134 @@ class GoalservePoller:
             except Exception as e:
                 log.error("Score update callback error: %s", e)
 
-    def _parse_full_feed(self, data: dict[str, Any]) -> set[str]:
-        """Parse full livescore response. Returns set of live match IDs."""
-        scores_root = data.get("scores", data)
-        categories = _ensure_list(scores_root.get("category", []))
-
-        live_ids: set[str] = set()
-
-        for category in categories:
-            cat_name = _g(category, "name", "")
-            surface = self._detect_surface(cat_name)
-            best_of = self._detect_best_of(cat_name)
-
-            matches = _ensure_list(category.get("match", []))
-
-            for match in matches:
-                match_id = str(_g(match, "id", ""))
-                if not match_id:
-                    continue
-
-                status = str(_g(match, "status", "")).lower().strip()
-                if status not in LIVE_STATUSES:
-                    continue
-
-                live_ids.add(match_id)
-
-                # Parse this match into ScoreState
-                self._parse_match(match_id, match, cat_name, surface, best_of)
-
-        return live_ids
-
     # ------------------------------------------------------------------
-    # Fast poll loop — update tracked matches individually
+    # Parsing
     # ------------------------------------------------------------------
 
-    async def _fast_poll_loop(self) -> None:
-        """Poll individual match endpoints for tracked matches."""
-        while self._running:
-            if self._tracked_ids:
-                tasks = [
-                    self._poll_match(mid) for mid in list(self._tracked_ids)
-                ]
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-                if self._on_scores_updated:
-                    try:
-                        await self._on_scores_updated()
-                    except Exception as e:
-                        log.error("Score update callback error: %s", e)
-
-            await asyncio.sleep(FAST_POLL_INTERVAL)
-
-    async def _poll_match(self, match_id: str) -> None:
-        """Fetch a single match by ID."""
-        assert self._session is not None
-        url = f"{GOALSERVE_BASE}/{self.config.goalserve_api_key}/tennis_scores/match"
-        params = {"id": match_id, "json": "1"}
-
-        try:
-            async with self._session.get(
-                url, params=params, timeout=aiohttp.ClientTimeout(total=5),
-            ) as resp:
-                if resp.status == 429:
-                    return  # skip this cycle
-                if resp.status >= 400:
-                    return
-                data = await resp.json(content_type=None)
-
-            self._parse_match_response(match_id, data)
-            self._record_success()
-        except Exception as e:
-            self._record_failure(e, f"match {match_id}")
-
-    def _parse_match_response(self, match_id: str, data: dict[str, Any]) -> None:
-        """Parse single match response.
-
-        The individual match endpoint may return the match nested under
-        scores/category/match or directly — handle both.
-        """
-        # Try to find the match in the response
-        scores_root = data.get("scores", data)
-        categories = _ensure_list(scores_root.get("category", []))
-
-        for category in categories:
-            cat_name = _g(category, "name", "")
-            surface = self._detect_surface(cat_name)
-            best_of = self._detect_best_of(cat_name)
-
-            matches = _ensure_list(category.get("match", []))
-            for match in matches:
-                mid = str(_g(match, "id", ""))
-                if mid == match_id:
-                    status = str(_g(match, "status", "")).lower().strip()
-                    if status in LIVE_STATUSES:
-                        self._parse_match(match_id, match, cat_name, surface, best_of)
-                    else:
-                        # Match is no longer live
-                        self._tracked_ids.discard(match_id)
-                        self.scores.pop(match_id, None)
-                    return
-
-        # If match not found in response, it may have ended
-        # Keep it tracked — discovery loop will clean it up
-
-    # ------------------------------------------------------------------
-    # Match parsing
-    # ------------------------------------------------------------------
-
-    def _parse_match(
-        self,
-        match_id: str,
-        match: dict,
-        cat_name: str,
-        surface: str,
-        best_of: int,
-    ) -> None:
-        """Parse a single match element into a ScoreState."""
-        state = self.scores.get(match_id)
-        if state is None:
-            state = ScoreState(match_id=match_id)
-            self.scores[match_id] = state
-
-        state.tournament = cat_name
-        state.surface = surface
-        state.best_of = best_of
-        state.source = ScoreSource.API
-        state.last_updated = time.time()
-
-        # Tiebreak flag
-        tb_str = str(_g(match, "tb", "False")).lower()
-        state.is_tiebreak = tb_str == "true"
-
-        # Players — two <player> elements per match
-        players = _ensure_list(match.get("player", []))
-        if len(players) < 2:
+    def _parse_feed(self, data: dict[str, Any]) -> None:
+        """Parse inplay feed into ScoreState objects."""
+        events = data.get("events", {})
+        if not isinstance(events, dict):
             return
 
-        p1 = players[0]
-        p2 = players[1]
+        seen_ids: set[str] = set()
 
-        state.player1_name = _g(p1, "name", state.player1_name)
-        state.player2_name = _g(p2, "name", state.player2_name)
+        for _key, evt in events.items():
+            info = evt.get("info", {})
+            match_id = str(info.get("id", ""))
+            if not match_id:
+                continue
 
-        # Server — each player has serve="True"/"False"
-        if str(_g(p1, "serve", "")).lower() == "true":
-            state.server = "player1"
-        elif str(_g(p2, "serve", "")).lower() == "true":
-            state.server = "player2"
+            # Check if match is live
+            state_code = self._safe_int(info.get("state"))
+            period = str(info.get("period", "")).strip()
+            if not period.lower().startswith("set"):
+                continue
 
-        # Set score — use totalscore (sets won by each player)
-        p1_sets = self._safe_int(_g(p1, "totalscore", "0"))
-        p2_sets = self._safe_int(_g(p2, "totalscore", "0"))
-        state.set_score = (p1_sets, p2_sets)
+            seen_ids.add(match_id)
 
-        # Game score in current set — parse s1-s5
-        status = str(_g(match, "status", "")).lower().strip()
-        self._parse_game_score(p1, p2, status, state)
+            state = self.scores.get(match_id)
+            if state is None:
+                state = ScoreState(match_id=match_id)
+                self.scores[match_id] = state
 
-        # Point score within current game
-        self._parse_point_score(p1, p2, state)
+            state.source = ScoreSource.API
+            state.last_updated = time.time()
 
-    def _parse_game_score(
-        self,
-        p1: dict,
-        p2: dict,
-        status: str,
-        state: ScoreState,
+            # Players — from "Name1 vs Name2" in info.name
+            match_name = info.get("name", "")
+            ti = evt.get("team_info", {})
+            state.player1_name = ti.get("home", {}).get("name", state.player1_name)
+            state.player2_name = ti.get("away", {}).get("name", state.player2_name)
+
+            # Tournament and surface from info.league
+            league = info.get("league", "")
+            state.tournament = league
+            state.surface = self._lookup_surface(league)
+            state.best_of = self._detect_best_of(league)
+
+            # Parse stats
+            stats = evt.get("stats", {})
+            self._parse_stats(stats, state_code, state)
+
+        # Remove finished/disappeared matches
+        for mid in list(self.scores.keys()):
+            if mid not in seen_ids:
+                del self.scores[mid]
+
+    def _parse_stats(
+        self, stats: dict[str, Any], state_code: int, state: ScoreState,
     ) -> None:
-        """Extract game score in the current set from s1-s5 attributes.
+        """Extract score data from the stats dict."""
+        turn = None
+        points = None
+        total_sets = None
+        set_scores: dict[int, dict] = {}
 
-        The current set is determined by match status ("set 1" -> s1, etc.).
-        Set scores can contain tiebreak scores after "." (e.g. "6.5" = 6 games,
-        5 tiebreak pts). We only take the game part (before the dot).
-        """
-        set_fields = {
-            "set 1": "s1", "set 2": "s2", "set 3": "s3",
-            "set 4": "s4", "set 5": "s5",
-        }
-        field_name = set_fields.get(status)
-        if not field_name:
-            return
+        for _k, v in stats.items():
+            if not isinstance(v, dict):
+                continue
+            name = v.get("name", "")
+            if name == "TURN":
+                turn = v
+            elif name == "POINTS":
+                points = v
+            elif name == "T":
+                total_sets = v
+            elif name.startswith("S") and name[1:].isdigit():
+                set_scores[int(name[1:])] = v
 
-        p1_raw = str(_g(p1, field_name, "0"))
-        p2_raw = str(_g(p2, field_name, "0"))
+        # Server — TURN: home=1 means home serves, away=1 means away serves
+        if turn is not None:
+            if turn.get("home") == 1:
+                state.server = "player1"
+            elif turn.get("away") == 1:
+                state.server = "player2"
 
-        # Strip tiebreak portion: "6.5" -> "6"
-        p1_games = self._safe_int(p1_raw.split(".")[0])
-        p2_games = self._safe_int(p2_raw.split(".")[0])
+        # Set score (sets won)
+        if total_sets is not None:
+            state.set_score = (
+                self._safe_int(total_sets.get("home")),
+                self._safe_int(total_sets.get("away")),
+            )
 
-        # game_score is stored as (server_games, receiver_games)
-        if state.server == "player1":
-            state.game_score = (p1_games, p2_games)
-        else:
-            state.game_score = (p2_games, p1_games)
+        # Game score in current set
+        if set_scores:
+            current_set_num = max(set_scores.keys())
+            cs = set_scores[current_set_num]
+            p1_games = self._safe_int(cs.get("home"))
+            p2_games = self._safe_int(cs.get("away"))
+            # Store as (server_games, receiver_games)
+            if state.server == "player1":
+                state.game_score = (p1_games, p2_games)
+            else:
+                state.game_score = (p2_games, p1_games)
 
-    def _parse_point_score(
-        self,
-        p1: dict,
-        p2: dict,
-        state: ScoreState,
-    ) -> None:
-        """Extract point score from each player's game_score attribute.
+        # Tiebreak detection
+        state.is_tiebreak = state_code in TIEBREAK_STATES or (
+            state.game_score[0] == 6 and state.game_score[1] == 6
+        )
 
-        Regular game: "", "0", "15", "30", "40", "A"
-        Tiebreak: actual point numbers "0", "1", "2", etc.
-        """
+        # Point score
         old_points = state.point_score
+        if points is not None:
+            p1_raw = points.get("home", 0)
+            p2_raw = points.get("away", 0)
 
-        p1_str = str(_g(p1, "game_score", "")).strip()
-        p2_str = str(_g(p2, "game_score", "")).strip()
+            if state.is_tiebreak:
+                # Tiebreak: points are actual counts (0, 1, 2, ...)
+                p1_pts = self._safe_int(p1_raw)
+                p2_pts = self._safe_int(p2_raw)
+            else:
+                # Regular game: points are tennis format (0, 15, 30, 40)
+                p1_pts = self._parse_game_point(p1_raw)
+                p2_pts = self._parse_game_point(p2_raw)
 
-        # If both empty, game is between points or just started
-        if not p1_str and not p2_str:
-            return
-
-        if state.is_tiebreak:
-            p1_pts = self._safe_int(p1_str)
-            p2_pts = self._safe_int(p2_str)
-        else:
-            p1_pts = self._parse_game_point(p1_str)
-            p2_pts = self._parse_game_point(p2_str)
-
-        # Store as (server_points, receiver_points)
-        if state.server == "player1":
-            state.point_score = (p1_pts, p2_pts)
-        else:
-            state.point_score = (p2_pts, p1_pts)
+            # Store as (server_points, receiver_points)
+            if state.server == "player1":
+                state.point_score = (p1_pts, p2_pts)
+            else:
+                state.point_score = (p2_pts, p1_pts)
 
         # Track points in current game for new-game filter
         if state.point_score == (0, 0) and old_points != (0, 0):
@@ -394,69 +279,147 @@ class GoalservePoller:
             state.points_in_current_game += 1
 
     # ------------------------------------------------------------------
-    # Health tracking
+    # Surface map from score feed
     # ------------------------------------------------------------------
 
-    def _record_success(self) -> None:
-        self.consecutive_failures = 0
-        self.last_success = time.time()
-        if self.is_degraded:
-            log.info("Goalserve recovered from degraded state")
-            self.is_degraded = False
+    async def _refresh_surface_map(self) -> None:
+        """Fetch the score feed to build tournament→surface mapping.
 
-    def _record_failure(self, error: Exception, context: str) -> None:
-        self.consecutive_failures += 1
-        log.error("Goalserve %s poll failed (#%d): %s",
-                  context, self.consecutive_failures, error)
-        if self.consecutive_failures >= 3:
-            self.is_degraded = True
+        The score feed category names include surface info, e.g.
+        "Atp - Singles: Bucharest (Romania), Clay"
+        The inplay feed only has "ATP Bucharest" — no surface.
+        We build a fuzzy lookup from score feed category names.
+        """
+        if not self._session:
+            return
+        try:
+            url = SCORE_FEED_URL.format(key=self.config.goalserve_api_key)
+            async with self._session.get(
+                url, params={"json": "1"},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    return
+                data = await resp.json(content_type=None)
+
+            categories = data.get("scores", {}).get("category", [])
+            if isinstance(categories, dict):
+                categories = [categories]
+
+            new_map: dict[str, str] = {}
+            for cat in categories:
+                name = cat.get("@name", cat.get("name", ""))
+                if not name:
+                    continue
+                # Extract surface from end of name: "..., Clay" or "..., Hard"
+                surface = "hard"
+                name_lower = name.lower()
+                if name_lower.endswith("clay"):
+                    surface = "clay"
+                elif name_lower.endswith("grass"):
+                    surface = "grass"
+                elif name_lower.endswith("hard"):
+                    surface = "hard"
+                elif "clay" in name_lower:
+                    surface = "clay"
+                elif "grass" in name_lower:
+                    surface = "grass"
+
+                # Extract the short tournament name for matching
+                # "Atp - Singles: Bucharest (Romania), Clay" → "bucharest"
+                short = self._extract_city(name)
+                if short:
+                    new_map[short] = surface
+
+            self._surface_map = new_map
+            self._surface_last_refresh = time.time()
+            log.info("Surface map refreshed: %d tournaments", len(new_map))
+
+        except Exception as e:
+            log.warning("Surface map refresh failed: %s", e)
+
+    @staticmethod
+    def _extract_city(category_name: str) -> str:
+        """Extract city/location from score feed category name.
+
+        'Atp - Singles: Bucharest (Romania), Clay' → 'bucharest'
+        'Itf Men - Singles: M25 Heraklion 2 (Greece), Hard' → 'heraklion'
+        """
+        # Take part after ':'
+        parts = category_name.split(":")
+        if len(parts) < 2:
+            return ""
+        location = parts[-1].strip()
+        # Remove surface suffix
+        for suffix in [", Clay", ", Hard", ", Grass", ", Carpet"]:
+            if location.endswith(suffix):
+                location = location[:-len(suffix)]
+        # Remove country in parentheses
+        if "(" in location:
+            location = location[:location.index("(")]
+        # Remove tournament tier prefix like "M25 ", "W50 "
+        location = location.strip()
+        tokens = location.split()
+        clean_tokens = []
+        for t in tokens:
+            # Skip tier codes and trailing numbers
+            if t[0].isdigit() or (len(t) <= 4 and t.isalpha() and t.isupper()):
+                continue
+            clean_tokens.append(t.lower())
+        return " ".join(clean_tokens).strip()
+
+    def _lookup_surface(self, league: str) -> str:
+        """Look up surface for an inplay league name like 'ATP Bucharest'."""
+        league_lower = league.lower()
+        # Direct keyword check first
+        if "clay" in league_lower:
+            return "clay"
+        if "grass" in league_lower:
+            return "grass"
+        if "hard" in league_lower:
+            return "hard"
+        # Fuzzy match: check both directions —
+        # inplay "M25 Santa Margherita" should match map key "santa margherita di pula"
+        # and map key "bucharest" should match inplay "ATP Bucharest"
+        best_match = ""
+        best_surface = "hard"
+        for city, surface in self._surface_map.items():
+            if not city:
+                continue
+            if city in league_lower or league_lower in city:
+                # Prefer longest match for accuracy
+                if len(city) > len(best_match):
+                    best_match = city
+                    best_surface = surface
+        return best_surface
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _parse_game_point(s: str) -> int:
-        """Convert tennis point string to internal representation (0-4)."""
-        s = s.strip().upper()
-        mapping = {"": 0, "0": 0, "15": 1, "30": 2, "40": 3, "A": 4, "AD": 4}
+    def _parse_game_point(val: Any) -> int:
+        """Convert tennis point (0/15/30/40/A) to internal representation (0-4)."""
+        s = str(val).strip().upper()
+        mapping = {"0": 0, "15": 1, "30": 2, "40": 3, "A": 4, "AD": 4}
         return mapping.get(s, 0)
 
     @staticmethod
-    def _safe_int(s: str) -> int:
-        s = str(s).strip()
-        if not s:
+    def _safe_int(val: Any) -> int:
+        if val is None:
             return 0
         try:
-            return int(s)
-        except ValueError:
+            return int(val)
+        except (ValueError, TypeError):
             return 0
 
     @staticmethod
-    def _detect_surface(category_name: str) -> str:
-        """Extract surface from category name.
-
-        Format: "Atp - Singles: Sofia (Bulgaria), Hard (Indoor)"
-        """
-        name_lower = category_name.lower()
-        if "clay" in name_lower:
-            return "clay"
-        if "grass" in name_lower:
-            return "grass"
-        if "hard" in name_lower:
-            return "hard"
-        if "carpet" in name_lower:
-            return "hard"
-        return "hard"
-
-    @staticmethod
-    def _detect_best_of(category_name: str) -> int:
+    def _detect_best_of(league: str) -> int:
         """Grand Slam men's singles is best of 5, everything else best of 3."""
-        name_lower = category_name.lower()
+        name_lower = league.lower()
         grand_slams = ["australian open", "roland garros", "french open",
                        "wimbledon", "us open"]
         for gs in grand_slams:
             if gs in name_lower:
-                if "singles" in name_lower and ("atp" in name_lower or "men" in name_lower):
-                    return 5
+                return 5
         return 3
