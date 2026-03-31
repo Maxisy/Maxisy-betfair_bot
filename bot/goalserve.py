@@ -135,6 +135,21 @@ class GoalservePoller:
                 raise RuntimeError(f"Goalserve inplay error: {resp.status}")
             data = await resp.json(content_type=None)
 
+        # Docs: if root updated_ts hasn't changed in 30s, all data is stale
+        feed_ts = data.get("updated_ts")
+        if feed_ts:
+            try:
+                feed_age = time.time() * 1000 - int(feed_ts)
+                if feed_age > 30_000:
+                    log.warning(
+                        "Goalserve feed stale (%.0fs old) — server may be disconnected",
+                        feed_age / 1000,
+                    )
+                    self.is_degraded = True
+                    return
+            except (ValueError, TypeError):
+                pass
+
         self._parse_feed(data)
 
         if self._on_scores_updated:

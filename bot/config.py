@@ -74,9 +74,22 @@ class Config:
         default_factory=lambda: {"hard": 0.63, "clay": 0.60, "grass": 0.65}
     )
 
-    # Excluded tournaments (keywords)
+    # Allowed tournament tiers (keywords to match in tournament name)
+    # Per spec: Challenger, ITF, ATP 250/500, WTA 250/500 only
+    # Exclude: Grand Slams, Masters 1000, doubles
+    allowed_tournaments: list[str] = field(
+        default_factory=lambda: [
+            # Goalserve inplay feed names
+            "ATP ",           # ATP 250/500 (e.g. "ATP Bucharest")
+            "WTA ",           # WTA 250/500
+            "Challenger",     # Challenger tour
+            "M15", "M25",     # ITF Men
+            "W15", "W25", "W35", "W50", "W60", "W75", "W100",  # ITF Women
+        ]
+    )
     excluded_tournaments: list[str] = field(
         default_factory=lambda: [
+            # These override allowed_tournaments
             "Grand Slam",
             "Wimbledon",
             "US Open",
@@ -85,8 +98,20 @@ class Config:
             "French Open",
             "Masters 1000",
             "ATP Masters",
+            "Indian Wells",
+            "Miami Open",
+            "Monte Carlo",
+            "Madrid",
+            "Rome",
+            "Canada",
+            "Cincinnati",
+            "Shanghai",
+            "Paris Masters",
             "WTA Premier Mandatory",
             "WTA Premier 5",
+            "WTA 1000",
+            " MD",            # Doubles (e.g. "ATP Marrakech MD")
+            " WD",            # Women's Doubles
         ]
     )
 

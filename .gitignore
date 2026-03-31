@@ -9,3 +9,5 @@ trades.jsonl
 logs/
 data/serve_stats.json
 .venv/
+.claude
+.pytest_cache

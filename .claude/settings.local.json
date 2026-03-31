@@ -2,7 +2,12 @@
   "permissions": {
     "allow": [
       "Bash(pip install:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(apt-get install:*)",
+      "Bash(apt-get update:*)",
+      "Bash(pdfinfo \"/root/betfair_bot/Tennis Data Feed.pdf\")",
+      "Bash(pdftotext \"/root/betfair_bot/Tennis Data Feed.pdf\" /tmp/goalserve_docs.txt)",
+      "Read(//tmp/**)"
     ]
   }
 }

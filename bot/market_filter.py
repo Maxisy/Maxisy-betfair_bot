@@ -75,16 +75,21 @@ class MarketFilter:
         if not score.is_fresh:
             return self._reject(market.market_id, "stale_model_state")
 
-        # Tournament filter — exclude Grand Slams and Masters 1000
-        if self._is_excluded_tournament(score.tournament):
-            return self._reject(market.market_id, "excluded_tournament")
+        # Tournament filter — must match allowed list and not be excluded
+        if not self._is_allowed_tournament(score.tournament):
+            return self._reject(market.market_id, "tournament_not_allowed")
 
         return True, ""
 
-    def _is_excluded_tournament(self, tournament: str) -> bool:
+    def _is_allowed_tournament(self, tournament: str) -> bool:
         tournament_lower = tournament.lower()
+        # First check exclusions (overrides allowed)
         for excluded in self.config.excluded_tournaments:
             if excluded.lower() in tournament_lower:
+                return False
+        # Then check if it matches any allowed tier
+        for allowed in self.config.allowed_tournaments:
+            if allowed.lower() in tournament_lower:
                 return True
         return False
 
