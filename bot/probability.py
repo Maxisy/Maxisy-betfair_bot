@@ -150,6 +150,13 @@ def prob_win_set(p_server: float, p_returner: float,
     if server_games == 6 and receiver_games == 6:
         return prob_win_tiebreak(p_server, p_returner, 0, 0)
 
+    # Safety: game score beyond 7 means Goalserve is mid-update
+    # (e.g., 7-6 before set score increments). Treat as set won/lost.
+    if server_games >= 7:
+        return 1.0
+    if receiver_games >= 7:
+        return 0.0
+
     # Current game is a service game for 'server'
     g = prob_win_game(p_server, 0, 0)  # prob server holds
 
@@ -203,14 +210,310 @@ def prob_win_match(p_server: float, p_returner: float,
 # Full model: from ScoreState → match win probability + model odds
 # ---------------------------------------------------------------------------
 
+def opponent_adjusted_serve_pct(
+    server_serve_pct: float,
+    returner_return_pct: float,
+    surface: str,
+) -> float:
+    """Adjust serve % based on opponent's return ability.
+
+    Baseline: an "average" returner against this server would win
+    (1 - server_serve_pct) of return points. If this specific returner
+    is better/worse than that, adjust accordingly.
+
+    This works across ATP/WTA/ITF because the baseline is relative to
+    the server's own level, not a fixed tour average.
+    """
+    if returner_return_pct < 0.01 or server_serve_pct < 0.01:
+        return server_serve_pct  # no return data, use raw serve %
+
+    # What an "average" opponent returns against this server
+    avg_ret_vs_server = 1.0 - server_serve_pct
+
+    # How much better/worse is this returner vs average?
+    ret_diff = returner_return_pct - avg_ret_vs_server
+
+    # Dampen the adjustment — don't apply full difference, use 50%
+    # to avoid over-correction from noisy data
+    adjusted = server_serve_pct - ret_diff * 0.5
+
+    return max(0.35, min(0.80, adjusted))
+
+
+def adjusted_serve_pct(
+    season_pct: float,
+    service_games: int,
+    service_holds: int,
+    aces: int,
+    double_faults: int,
+    recent_holds: list[bool] | None = None,
+) -> float:
+    """Blend season serve % with in-match performance.
+
+    Uses service hold rate and ace/DF counts to adjust the season average.
+    Applies momentum weighting from recent service games.
+    Small sample sizes are dampened to avoid overreacting early in a match.
+    """
+    if season_pct < 0.01 or service_games < 3:
+        return season_pct  # not enough match data to adjust
+
+    # Expected hold rate from season serve %
+    expected_hold = prob_win_game(round(season_pct, 4), 0, 0)
+    if expected_hold < 0.01:
+        return season_pct
+
+    # --- Momentum: weight recent games more heavily ---
+    # If we have a rolling window, blend recent hold rate (60%) with
+    # overall hold rate (40%) for the actual_hold calculation
+    overall_hold = service_holds / service_games
+    if recent_holds and len(recent_holds) >= 3:
+        recent_hold_rate = sum(recent_holds) / len(recent_holds)
+        actual_hold = 0.6 * recent_hold_rate + 0.4 * overall_hold
+    else:
+        actual_hold = overall_hold
+
+    hold_ratio = actual_hold / expected_hold
+
+    # Ace/DF signal: net aces per service game as a small bonus/penalty
+    # Each net ace per game ≈ +0.5% serve, each net DF ≈ -0.5%
+    net_aces = aces - double_faults
+    ace_adj = (net_aces / service_games) * 0.005 if service_games > 0 else 0.0
+
+    # Weight increases with sample size, caps at 0.3 (30% influence)
+    weight = min(service_games / 20.0, 0.30)
+
+    adjusted = season_pct * (1.0 + weight * (hold_ratio - 1.0)) + ace_adj
+    return max(0.35, min(0.80, adjusted))
+
+
+def fatigue_adjustment(serve_pct: float, total_points: int) -> float:
+    """Apply fatigue penalty for long matches.
+
+    After 200 points (~2 hours), serve % drops gradually.
+    Penalty: -0.3% per 50 points beyond 200 (caps at -3%).
+    """
+    if total_points <= 200:
+        return serve_pct
+
+    excess = total_points - 200
+    penalty = min(excess / 50 * 0.003, 0.03)  # max 3% penalty
+    return max(0.35, serve_pct - penalty)
+
+
+def set_context_adjustment(serve_pct: float, server_sets: int, receiver_sets: int,
+                           sets_to_win: int) -> float:
+    """Adjust serve % based on set score context.
+
+    Trailing players serve more aggressively in deciding sets.
+    Leading players play more conservatively.
+    """
+    if sets_to_win <= 1:
+        return serve_pct  # not applicable
+
+    # Deciding set (e.g., 1-1 in best of 3, 2-2 in best of 5)
+    if server_sets == sets_to_win - 1 and receiver_sets == sets_to_win - 1:
+        return serve_pct + 0.008  # +0.8% — both under pressure, server benefits
+
+    # Trailing player: more aggressive serving
+    if receiver_sets == sets_to_win - 1 and server_sets < receiver_sets:
+        return serve_pct + 0.010  # +1.0% — desperation serving
+
+    # Comfortably leading: slight conservatism
+    if server_sets == sets_to_win - 1 and receiver_sets == 0:
+        return serve_pct - 0.005  # -0.5% — may ease off
+
+    return serve_pct
+
+
+def elo_win_probability(elo1: float, elo2: float) -> float:
+    """Expected win probability for player 1 from Elo ratings.
+
+    Standard Elo formula: P(win) = 1 / (1 + 10^((elo2 - elo1) / 400))
+    A 100-point gap ≈ 64% win rate (best-of-3 adjusted by TA).
+    """
+    if elo1 < 1000 or elo2 < 1000:
+        return 0.5  # no valid Elo data
+    return 1.0 / (1.0 + 10.0 ** ((elo2 - elo1) / 400.0))
+
+
+def book_odds_to_prob(odds: float) -> float:
+    """Convert decimal odds to implied probability (no margin removal)."""
+    if odds <= 1.0:
+        return 1.0
+    return 1.0 / odds
+
+
+def calibrate_serve_pcts(
+    p1_serve: float,
+    p2_serve: float,
+    target_p1_prob: float,
+    best_of: int = 3,
+) -> tuple[float, float]:
+    """Calibrate serve %s so the Markov model matches a target win probability.
+
+    Uses binary search on a quality offset δ applied symmetrically:
+      p1_calibrated = p1_serve + δ
+      p2_calibrated = p2_serve - δ
+
+    This shifts the model's baseline to match book/Elo pre-match pricing,
+    so in-match adjustments work relative to a correct starting point.
+
+    Returns (p1_calibrated, p2_calibrated).
+    """
+    if target_p1_prob <= 0.01 or target_p1_prob >= 0.99:
+        return p1_serve, p2_serve
+
+    sets_to_win = 2 if best_of == 3 else 3
+
+    def model_p1(delta: float) -> float:
+        p1 = max(0.35, min(0.80, p1_serve + delta))
+        p2 = max(0.35, min(0.80, p2_serve - delta))
+        # Match probability from 0-0, 0-0 with P1 serving first
+        return prob_win_match(round(p1, 4), round(p2, 4), 0, 0, sets_to_win)
+
+    # Binary search on delta
+    lo, hi = -0.20, 0.20
+    for _ in range(40):
+        mid = (lo + hi) / 2
+        if model_p1(mid) < target_p1_prob:
+            lo = mid
+        else:
+            hi = mid
+
+    delta = (lo + hi) / 2
+    return (
+        max(0.35, min(0.80, p1_serve + delta)),
+        max(0.35, min(0.80, p2_serve - delta)),
+    )
+
+
+def get_prior_p1_prob(
+    opening_book_odds: tuple[float, float],
+    elo1: float,
+    elo2: float,
+) -> float | None:
+    """Get pre-match P1 win probability from book odds or Elo.
+
+    Returns None if no prior available.
+    """
+    book_p1, book_p2 = opening_book_odds
+    if book_p1 > 1.0 and book_p2 > 1.0:
+        raw_p1 = book_odds_to_prob(book_p1)
+        raw_p2 = book_odds_to_prob(book_p2)
+        total = raw_p1 + raw_p2
+        return raw_p1 / total if total > 0 else None
+
+    if elo1 > 1000 and elo2 > 1000:
+        return elo_win_probability(elo1, elo2)
+
+    return None
+
+
+def break_point_adjustment(serve_pct: float, bp_faced: int, bp_saved: int) -> float:
+    """Adjust serve % based on break point performance.
+
+    Players who save break points at a high rate are "clutch" servers.
+    Players who crumble on break points will underperform their hold rate.
+    Requires 4+ break points faced for signal.
+    """
+    if bp_faced < 4:
+        return serve_pct
+
+    save_rate = bp_saved / bp_faced
+    # Expected save rate under pressure ≈ 60% (league average)
+    expected_save = 0.60
+    diff = save_rate - expected_save
+
+    # Dampen: apply 40% of the difference as adjustment
+    # Scale: 10% better save rate → +0.4% serve adjustment
+    adj = diff * 0.04
+    return max(0.35, min(0.80, serve_pct + adj))
+
+
 def calculate_model_odds(state: ScoreState) -> tuple[float, float]:
     """Calculate model probability and decimal odds for the SERVER winning.
+
+    Pipeline:
+    1. Get raw serve %s from TA + opponent return adjustment
+    2. Calibrate against book odds / Elo (shift serve %s to match pre-match pricing)
+    3. Apply in-match adjustments (holds/breaks/momentum/aces)
+    4. Apply fatigue, set context, break point adjustments
+    5. Run Markov chain from current score state
 
     Returns (probability, model_odds_decimal).
     model_odds is rounded to nearest Betfair tick.
     """
-    p_serve = state.server_serve_pct
-    p_return_serve = state.receiver_serve_pct  # other player's serve %
+    # Step 1: Adjust serve % for opponent's return ability
+    p1_serve_raw = opponent_adjusted_serve_pct(
+        state.player1_serve_pct, state.player2_return_pct, state.surface)
+    p2_serve_raw = opponent_adjusted_serve_pct(
+        state.player2_serve_pct, state.player1_return_pct, state.surface)
+
+    # Step 2: Calibrate serve %s against book odds / Elo prior
+    # This shifts the model inputs so that at 0-0 0-0, the model produces
+    # the same probability as the bookmaker. Quality gaps are now baked in.
+    prior = get_prior_p1_prob(
+        state.opening_book_odds, state.player1_elo, state.player2_elo)
+    if prior is not None:
+        p1_base, p2_base = calibrate_serve_pcts(
+            p1_serve_raw, p2_serve_raw, prior, state.best_of)
+    else:
+        p1_base, p2_base = p1_serve_raw, p2_serve_raw
+
+    # Step 3: In-match adjustments (holds/breaks/aces + momentum)
+    # These adjust RELATIVE to the calibrated baseline
+    if state.server == "player1":
+        p_serve = adjusted_serve_pct(
+            p1_base,
+            state.player1_service_games,
+            state.player1_service_holds,
+            state.player1_aces,
+            state.player1_double_faults,
+            state.player1_recent_holds,
+        )
+        p_return_serve = adjusted_serve_pct(
+            p2_base,
+            state.player2_service_games,
+            state.player2_service_holds,
+            state.player2_aces,
+            state.player2_double_faults,
+            state.player2_recent_holds,
+        )
+        server_sets, receiver_sets = state.set_score
+        server_bp_faced = state.player1_bp_faced
+        server_bp_saved = state.player1_bp_saved
+    else:
+        p_serve = adjusted_serve_pct(
+            p2_base,
+            state.player2_service_games,
+            state.player2_service_holds,
+            state.player2_aces,
+            state.player2_double_faults,
+            state.player2_recent_holds,
+        )
+        p_return_serve = adjusted_serve_pct(
+            p1_base,
+            state.player1_service_games,
+            state.player1_service_holds,
+            state.player1_aces,
+            state.player1_double_faults,
+            state.player1_recent_holds,
+        )
+        receiver_sets, server_sets = state.set_score
+        server_bp_faced = state.player2_bp_faced
+        server_bp_saved = state.player2_bp_saved
+
+    # Step 4: Fatigue adjustment for long matches
+    p_serve = fatigue_adjustment(p_serve, state.total_points_played)
+    p_return_serve = fatigue_adjustment(p_return_serve, state.total_points_played)
+
+    # Step 5: Set context adjustment (desperation/comfort serving)
+    sets_to_win = 2 if state.best_of == 3 else 3
+    p_serve = set_context_adjustment(p_serve, server_sets, receiver_sets, sets_to_win)
+    p_return_serve = set_context_adjustment(p_return_serve, receiver_sets, server_sets, sets_to_win)
+
+    # Step 6: Break point clutch/choke adjustment
+    p_serve = break_point_adjustment(p_serve, server_bp_faced, server_bp_saved)
 
     sg, rg = state.game_score
 
@@ -251,13 +554,7 @@ def calculate_model_odds(state: ScoreState) -> tuple[float, float]:
         p_set = g * p_set_after_hold + (1 - g) * p_set_after_break
 
     # Layer 4: probability server wins match from current set score
-    sets_to_win = 2 if state.best_of == 3 else 3
-
-    # Determine server's set count and receiver's set count
-    if state.server == "player1":
-        server_sets, receiver_sets = state.set_score
-    else:
-        receiver_sets, server_sets = state.set_score
+    # (sets_to_win, server_sets, receiver_sets already computed in step 4)
 
     # Combine current set probability with remaining sets
     if server_sets + 1 >= sets_to_win:
@@ -289,8 +586,9 @@ def calculate_model_odds(state: ScoreState) -> tuple[float, float]:
 def calculate_player1_win_prob(state: ScoreState) -> tuple[float, float]:
     """Return (probability_player1_wins, model_odds_for_player1).
 
-    Internally calls calculate_model_odds which gives server's perspective,
-    then converts to player1's perspective.
+    The model's serve %s are calibrated against book odds / Elo pre-match,
+    so the Markov chain starts from correct baseline probabilities.
+    In-match adjustments then shift relative to that baseline.
     """
     p_server, model_odds_server = calculate_model_odds(state)
 
@@ -302,3 +600,32 @@ def calculate_player1_win_prob(state: ScoreState) -> tuple[float, float]:
     p1 = max(0.001, min(0.999, p1))
     odds_p1 = nearest_tick(1.0 / p1)
     return p1, odds_p1
+
+
+def calculate_player1_win_prob_uncalibrated(state: ScoreState) -> tuple[float, float]:
+    """Return model probability WITHOUT book/Elo calibration (for comparison).
+
+    Uses raw TA serve %s + opponent adjustment only, no book odds calibration.
+    Useful for logging to see how much the calibration changed things.
+    """
+    # Temporarily clear the prior sources
+    saved_book = state.opening_book_odds
+    saved_elo1 = state.player1_elo
+    saved_elo2 = state.player2_elo
+    state.opening_book_odds = (0.0, 0.0)
+    state.player1_elo = 0.0
+    state.player2_elo = 0.0
+
+    try:
+        p_server, _ = calculate_model_odds(state)
+        if state.server == "player1":
+            p1 = p_server
+        else:
+            p1 = 1.0 - p_server
+        p1 = max(0.001, min(0.999, p1))
+        odds_p1 = nearest_tick(1.0 / p1)
+        return p1, odds_p1
+    finally:
+        state.opening_book_odds = saved_book
+        state.player1_elo = saved_elo1
+        state.player2_elo = saved_elo2

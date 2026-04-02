@@ -177,14 +177,37 @@ class Bot:
 
     async def _on_scores_updated(self) -> None:
         """Called after Goalserve poll updates scores."""
-        # Update serve percentages from loaded stats
         for state in self.goalserve.scores.values():
-            state.player1_serve_pct = self.serve_stats.get_serve_pct(
+            p1 = self.serve_stats.get_serve_pct(
                 state.player1_name, state.surface,
             )
-            state.player2_serve_pct = self.serve_stats.get_serve_pct(
+            p2 = self.serve_stats.get_serve_pct(
                 state.player2_name, state.surface,
             )
+            state.player1_serve_pct = p1 if p1 is not None else 0.0
+            state.player2_serve_pct = p2 if p2 is not None else 0.0
+
+            # Return win %
+            r1 = self.serve_stats.get_return_pct(
+                state.player1_name, state.surface,
+            )
+            r2 = self.serve_stats.get_return_pct(
+                state.player2_name, state.surface,
+            )
+            state.player1_return_pct = r1 if r1 is not None else 0.0
+            state.player2_return_pct = r2 if r2 is not None else 0.0
+
+            # Elo ratings (surface-specific)
+            e1 = self.serve_stats.get_elo(state.player1_name, state.surface)
+            e2 = self.serve_stats.get_elo(state.player2_name, state.surface)
+            state.player1_elo = e1 if e1 is not None else 0.0
+            state.player2_elo = e2 if e2 is not None else 0.0
+
+            # Trigger background fetch for unknown players (non-blocking)
+            if p1 is None and state.player1_name:
+                self.serve_stats.ensure_player(state.player1_name, state.surface)
+            if p2 is None and state.player2_name:
+                self.serve_stats.ensure_player(state.player2_name, state.surface)
 
     async def _on_trade_closed(
         self,

@@ -79,6 +79,20 @@ class MarketFilter:
         if not self._is_allowed_tournament(score.tournament):
             return self._reject(market.market_id, "tournament_not_allowed")
 
+        # Require real TA serve data for both players — no trading on defaults
+        if score.player1_serve_pct < 0.01 or score.player2_serve_pct < 0.01:
+            return self._reject(market.market_id, "missing_serve_data")
+
+        # Only trade matches tracked from the start — no mid-match joins
+        # without full hold/break history
+        if not score.tracked_from_start:
+            return self._reject(market.market_id, "joined_mid_match")
+
+        # Require minimum service games so in-match adjustments have data
+        total_svc = score.player1_service_games + score.player2_service_games
+        if total_svc < self.config.min_service_games:
+            return self._reject(market.market_id, "too_few_service_games")
+
         return True, ""
 
     def _is_allowed_tournament(self, tournament: str) -> bool:

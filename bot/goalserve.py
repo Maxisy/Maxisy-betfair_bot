@@ -74,6 +74,9 @@ class GoalservePoller:
 
         # match_id -> ScoreState
         self.scores: dict[str, ScoreState] = {}
+        # True after first poll completes — matches seen on first poll are
+        # marked as not tracked_from_start since we don't know their history
+        self._first_poll_done: bool = False
 
         # Tournament name -> surface (from score feed)
         self._surface_map: dict[str, str] = {}
@@ -188,6 +191,10 @@ class GoalservePoller:
             if state is None:
                 state = ScoreState(match_id=match_id)
                 self.scores[match_id] = state
+                # Only matches that appear AFTER the first poll can be
+                # tracked from start — anything on the first poll was
+                # already in progress and we have no hold/break history
+                state.tracked_from_start = self._first_poll_done
 
             state.source = ScoreSource.API
             state.last_updated = time.time()
@@ -212,6 +219,10 @@ class GoalservePoller:
         for mid in list(self.scores.keys()):
             if mid not in seen_ids:
                 del self.scores[mid]
+
+        # After first parse, all subsequent new matches are tracked from start
+        if not self._first_poll_done:
+            self._first_poll_done = True
 
     def _parse_stats(
         self, stats: dict[str, Any], state_code: int, state: ScoreState,
@@ -292,6 +303,36 @@ class GoalservePoller:
             state.points_in_current_game = 0
         elif state.point_score != old_points:
             state.points_in_current_game += 1
+
+        # Track total points played (for fatigue estimation)
+        if state.point_score != old_points:
+            state.total_points_played += 1
+
+        # Track break points faced/saved
+        # Break point = receiver has 3+ pts (40) and server has < 3 (< 40),
+        # or receiver has advantage (Ad). Detect transition through break point.
+        self._detect_break_point(state, old_points)
+
+        # Track aces and double faults from state codes
+        if state_code == 11117:  # Player 1 ace
+            state.player1_aces += 1
+        elif state_code == 21117:  # Player 2 ace
+            state.player2_aces += 1
+        elif state_code == 11116:  # Player 1 double fault
+            state.player1_double_faults += 1
+        elif state_code == 21116:  # Player 2 double fault
+            state.player2_double_faults += 1
+
+        # Detect service game completions (hold or break)
+        # Compare raw game scores (p1_games, p2_games) before/after
+        if set_scores:
+            current_set_num = max(set_scores.keys())
+            cs = set_scores[current_set_num]
+            p1_games = self._safe_int(cs.get("home"))
+            p2_games = self._safe_int(cs.get("away"))
+            raw_game = (p1_games, p2_games)
+
+            self._detect_service_game_result(state, raw_game)
 
     # ------------------------------------------------------------------
     # Surface map from score feed
@@ -407,6 +448,117 @@ class GoalservePoller:
                     best_match = city
                     best_surface = surface
         return best_surface
+
+    # ------------------------------------------------------------------
+    # In-match tracking
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _record_game_result(state: ScoreState, player: str, held: bool) -> None:
+        """Record a service game result for hold/break stats and rolling window."""
+        if player == "player1":
+            state.player1_service_games += 1
+            if held:
+                state.player1_service_holds += 1
+            state.player1_recent_holds.append(held)
+            # Keep only last 5 games for rolling window
+            if len(state.player1_recent_holds) > 5:
+                state.player1_recent_holds.pop(0)
+        elif player == "player2":
+            state.player2_service_games += 1
+            if held:
+                state.player2_service_holds += 1
+            state.player2_recent_holds.append(held)
+            if len(state.player2_recent_holds) > 5:
+                state.player2_recent_holds.pop(0)
+
+    @staticmethod
+    def _detect_break_point(state: ScoreState, old_points: tuple[int, int]) -> None:
+        """Detect break point situations and track saves/conversions.
+
+        Break point = receiver at match point in the game (3+ pts, leading server).
+        In tennis notation: receiver at 40 when server at 0/15/30, or Ad receiver.
+        Point encoding: 0=0, 1=15, 2=30, 3=40, 4=Ad.
+        """
+        if state.point_score == old_points:
+            return  # no point change
+
+        # Check if the OLD point score was a break point
+        # (server_pts, receiver_pts) — break point when receiver >= 3 and receiver > server
+        # or when receiver == 3 and server <= 2 (30-40, 15-40, 0-40)
+        old_server, old_receiver = old_points
+        was_break_point = (
+            (old_receiver >= 3 and old_server <= 2) or  # 0-40, 15-40, 30-40
+            (old_receiver == 4 and old_server == 3)      # Ad receiver
+        )
+        if not was_break_point:
+            return
+
+        # Determine who was serving at the old point
+        server = state._prev_server or state.server
+
+        # The point was a break point — did the server save it?
+        new_server, new_receiver = state.point_score
+        # Server saved if: server gained a point or we're back to deuce
+        server_saved = (new_server > old_server) or (new_server == 3 and new_receiver == 3)
+
+        if server == "player1":
+            state.player1_bp_faced += 1
+            if server_saved:
+                state.player1_bp_saved += 1
+        elif server == "player2":
+            state.player2_bp_faced += 1
+            if server_saved:
+                state.player2_bp_saved += 1
+
+    @staticmethod
+    def _detect_service_game_result(state: ScoreState, raw_game: tuple[int, int]) -> None:
+        """Detect when a service game completes and record hold/break.
+
+        Compares current raw game score (p1_games, p2_games) against
+        previous to detect game transitions. Uses _prev_server to know
+        who was serving the completed game.
+        """
+        prev_raw = state._prev_game_score
+        prev_server = state._prev_server
+
+        # Check for set change (games reset)
+        set_changed = state.set_score != state._prev_set_score
+
+        if set_changed and state._prev_set_score != (0, 0):
+            p1_prev_sets, p2_prev_sets = state._prev_set_score
+            p1_sets, p2_sets = state.set_score
+            if p1_sets > p1_prev_sets:
+                set_winner = "player1"
+            elif p2_sets > p2_prev_sets:
+                set_winner = "player2"
+            else:
+                set_winner = ""
+
+            if prev_server and set_winner:
+                held = (prev_server == set_winner)
+                GoalservePoller._record_game_result(state, prev_server, held)
+
+        elif not set_changed and prev_raw != (0, 0):
+            prev_total = prev_raw[0] + prev_raw[1]
+            curr_total = raw_game[0] + raw_game[1]
+
+            if curr_total == prev_total + 1 and prev_server:
+                p1_gained = raw_game[0] > prev_raw[0]
+                p2_gained = raw_game[1] > prev_raw[1]
+
+                if prev_server == "player1":
+                    held = p1_gained
+                elif prev_server == "player2":
+                    held = p2_gained
+                else:
+                    held = False
+                GoalservePoller._record_game_result(state, prev_server, held)
+
+        # Update previous state for next comparison
+        state._prev_game_score = raw_game
+        state._prev_set_score = state.set_score
+        state._prev_server = state.server
 
     # ------------------------------------------------------------------
     # Helpers

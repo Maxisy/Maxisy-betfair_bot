@@ -34,6 +34,7 @@ class Config:
 
     # --- Trading constants ---
     min_edge: float = 0.06  # 6%
+    max_edge: float = 0.15  # 15% — reject trades where model wildly disagrees with market
     min_net_profit: float = 0.38  # £0.38
     commission_rate: float = 0.05  # 5%
     min_odds: float = 1.15
@@ -49,6 +50,7 @@ class Config:
     max_trades_per_minute: int = 20
     model_staleness_seconds: int = 30
     new_game_skip_points: int = 2
+    min_service_games: int = 8  # require 8 total service games before trading
 
     # Stake sizing
     stake_pct: float = 0.02  # 2% of float

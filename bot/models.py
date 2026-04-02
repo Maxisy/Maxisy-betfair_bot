@@ -46,8 +46,10 @@ class ScoreState:
     set_score: tuple[int, int] = (0, 0)  # (player1_sets, player2_sets)
     best_of: int = 3
     surface: str = "hard"
-    player1_serve_pct: float = 0.63
-    player2_serve_pct: float = 0.63
+    player1_serve_pct: float = 0.0  # 0.0 = no TA data
+    player2_serve_pct: float = 0.0  # 0.0 = no TA data
+    player1_return_pct: float = 0.0  # 0.0 = no TA data
+    player2_return_pct: float = 0.0  # 0.0 = no TA data
     last_updated: float = 0.0
     source: ScoreSource = ScoreSource.API
     # Selection IDs for Betfair
@@ -59,6 +61,38 @@ class ScoreState:
     points_in_current_game: int = 0
     # True when the current game is a tiebreak (from Goalserve tb flag)
     is_tiebreak: bool = False
+
+    # In-match performance tracking (for serve % adjustment)
+    player1_service_games: int = 0
+    player1_service_holds: int = 0
+    player2_service_games: int = 0
+    player2_service_holds: int = 0
+    player1_aces: int = 0
+    player1_double_faults: int = 0
+    player2_aces: int = 0
+    player2_double_faults: int = 0
+    # Rolling window of recent service game results (True=hold, False=break)
+    player1_recent_holds: list[bool] = field(default_factory=list)
+    player2_recent_holds: list[bool] = field(default_factory=list)
+    # Total points played (for fatigue estimation)
+    total_points_played: int = 0
+    # Break points faced/saved per player
+    player1_bp_faced: int = 0
+    player1_bp_saved: int = 0
+    player2_bp_faced: int = 0
+    player2_bp_saved: int = 0
+    # Opening book odds captured on first sighting (baseline prior)
+    opening_book_odds: tuple[float, float] = (0.0, 0.0)  # (p1_odds, p2_odds)
+    # Elo ratings (surface-specific)
+    player1_elo: float = 0.0
+    player2_elo: float = 0.0
+    # True if we've tracked this match from the start (first seen at 0-0 0-0)
+    tracked_from_start: bool = False
+    # Previous state for detecting game transitions
+    _prev_game_score: tuple[int, int] = (0, 0)
+    _prev_set_score: tuple[int, int] = (0, 0)
+    _prev_server: str = ""
+    _prev_point_score: tuple[int, int] = (0, 0)
 
     @property
     def is_fresh(self) -> bool:

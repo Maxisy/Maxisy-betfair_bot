@@ -128,6 +128,15 @@ class TradingEngine:
         if edge < self.config.min_edge:
             return
 
+        # Reject suspiciously large edges — model likely wrong, not the market
+        if edge > self.config.max_edge:
+            log.debug(
+                "Edge too large (%.1f%% > %.1f%%), skipping %s — model=%.2f market=%.2f",
+                edge * 100, self.config.max_edge * 100,
+                score.player1_name, p1_model_odds, market_odds,
+            )
+            return
+
         # Step 5: Check odds range
         if market_odds < self.config.min_odds or market_odds > self.config.max_odds:
             return
