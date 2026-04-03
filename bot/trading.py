@@ -67,6 +67,14 @@ class TradingEngine:
         # Find matching score state
         score = self._find_score(market_id, scores)
 
+        # Set live book odds for continuous re-calibration
+        if score and score.player1_selection_id:
+            r1 = market.runners.get(score.player1_selection_id)
+            r2 = market.runners.get(score.player2_selection_id) if score.player2_selection_id else None
+            p1_mkt = r1.best_back_price if r1 else 0.0
+            p2_mkt = r2.best_back_price if r2 else 0.0
+            score.live_book_odds = (p1_mkt, p2_mkt)
+
         # Log model tape for post-match backtesting
         if self.signal_logger and score and score.is_fresh:
             self.signal_logger.log_model_tick(market_id, score)
@@ -102,9 +110,6 @@ class TradingEngine:
         if self.positions.has_position(market_id):
             return
 
-        # Step 3: Calculate model odds
-        p1_prob, p1_model_odds = calculate_player1_win_prob(score)
-
         # Get player1's selection ID and market odds
         sel_id = score.player1_selection_id
         if sel_id == 0:
@@ -117,6 +122,9 @@ class TradingEngine:
         market_odds = runner.best_back_price
         if market_odds <= 0:
             return
+
+        # Step 3: Calculate model odds (calibrated against live book odds)
+        p1_prob, p1_model_odds = calculate_player1_win_prob(score)
 
         # Market filter (Section 15)
         passes, reason = self.market_filter.qualifies(market, score, sel_id)
@@ -216,7 +224,7 @@ class TradingEngine:
         market: MarketState,
         score: Optional[ScoreState],
     ) -> None:
-        # Get model odds for edge-gone check
+        # Get model odds for edge-gone check (live_book_odds already set)
         model_odds = 0.0
         if score and score.is_fresh:
             _, model_odds = calculate_player1_win_prob(score)

@@ -210,6 +210,8 @@ async def main():
                     if not bk:
                         continue
 
+                    # Set live book odds for continuous re-calibration
+                    state.live_book_odds = bk
                     p1_prob, p1_model_odds = calculate_player1_win_prob(state)
                     p1_raw_prob, p1_raw_odds = calculate_player1_win_prob_uncalibrated(state)
                     p1_book, p2_book = bk
@@ -223,12 +225,15 @@ async def main():
                         state.player1_serve_pct, state.player2_return_pct, state.surface)
                     p2_opp_adj = opponent_adjusted_serve_pct(
                         state.player2_serve_pct, state.player1_return_pct, state.surface)
-                    # Get calibrated base (same as model uses internally)
-                    prior = get_prior_p1_prob(
-                        state.opening_book_odds, state.player1_elo, state.player2_elo)
-                    if prior is not None:
+                    # Get live-calibrated base (same as model uses internally)
+                    from bot.probability import book_odds_to_prob as _b2p
+                    raw_p1 = _b2p(bk[0])
+                    raw_p2 = _b2p(bk[1])
+                    _total = raw_p1 + raw_p2
+                    live_prior = raw_p1 / _total if _total > 0 else None
+                    if live_prior is not None:
                         p1_cal, p2_cal = calibrate_serve_pcts(
-                            p1_opp_adj, p2_opp_adj, prior, state.best_of)
+                            p1_opp_adj, p2_opp_adj, live_prior, state=state)
                     else:
                         p1_cal, p2_cal = p1_opp_adj, p2_opp_adj
                     p1_adj = adjusted_serve_pct(

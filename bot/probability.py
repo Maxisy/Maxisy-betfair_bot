@@ -343,10 +343,86 @@ def book_odds_to_prob(odds: float) -> float:
     return 1.0 / odds
 
 
+def _bare_match_prob_p1(
+    p1_serve: float,
+    p2_serve: float,
+    state: ScoreState,
+) -> float:
+    """Calculate P1 match win probability from current score using bare serve %s.
+
+    No in-match adjustments — just raw Markov chain from current score state.
+    Used as the objective function for calibration binary search.
+    """
+    sets_to_win = 2 if state.best_of == 3 else 3
+
+    if state.server == "player1":
+        p_serve = p1_serve
+        p_return_serve = p2_serve
+        server_sets, receiver_sets = state.set_score
+    else:
+        p_serve = p2_serve
+        p_return_serve = p1_serve
+        receiver_sets, server_sets = state.set_score
+
+    p_serve_r = round(p_serve, 4)
+    p_ret_r = round(p_return_serve, 4)
+
+    sg, rg = state.game_score
+
+    if state.is_tiebreak:
+        g = prob_win_tiebreak(
+            p_serve_r, p_ret_r,
+            state.point_score[0], state.point_score[1],
+        )
+        p_set = g
+    else:
+        g = prob_win_game(p_serve_r, state.point_score[0], state.point_score[1])
+
+        if sg + 1 >= 6 and (sg + 1) - rg >= 2:
+            p_set_after_hold = 1.0
+        elif sg + 1 == 6 and rg == 6:
+            p_set_after_hold = prob_win_tiebreak(p_serve_r, p_ret_r, 0, 0)
+        else:
+            p_set_after_hold = 1.0 - prob_win_set(p_ret_r, p_serve_r, rg, sg + 1)
+
+        if rg + 1 >= 6 and (rg + 1) - sg >= 2:
+            p_set_after_break = 0.0
+        elif rg + 1 == 6 and sg == 6:
+            p_set_after_break = prob_win_tiebreak(p_ret_r, p_serve_r, 0, 0)
+            p_set_after_break = 1.0 - p_set_after_break
+        else:
+            p_set_after_break = 1.0 - prob_win_set(p_ret_r, p_serve_r, rg + 1, sg)
+
+        p_set = g * p_set_after_hold + (1 - g) * p_set_after_break
+
+    if server_sets + 1 >= sets_to_win:
+        p_match_after_win_set = 1.0
+    else:
+        p_match_after_win_set = prob_win_match(
+            p_serve_r, p_ret_r,
+            server_sets + 1, receiver_sets, sets_to_win,
+        )
+
+    if receiver_sets + 1 >= sets_to_win:
+        p_match_after_lose_set = 0.0
+    else:
+        p_match_after_lose_set = prob_win_match(
+            p_serve_r, p_ret_r,
+            server_sets, receiver_sets + 1, sets_to_win,
+        )
+
+    p_server = p_set * p_match_after_win_set + (1 - p_set) * p_match_after_lose_set
+
+    if state.server == "player1":
+        return p_server
+    return 1.0 - p_server
+
+
 def calibrate_serve_pcts(
     p1_serve: float,
     p2_serve: float,
     target_p1_prob: float,
+    state: ScoreState | None = None,
     best_of: int = 3,
 ) -> tuple[float, float]:
     """Calibrate serve %s so the Markov model matches a target win probability.
@@ -355,21 +431,28 @@ def calibrate_serve_pcts(
       p1_calibrated = p1_serve + δ
       p2_calibrated = p2_serve - δ
 
-    This shifts the model's baseline to match book/Elo pre-match pricing,
-    so in-match adjustments work relative to a correct starting point.
+    When a ScoreState is provided, calibrates at the CURRENT score position
+    (live re-calibration). Otherwise calibrates at 0-0 0-0 (opening only).
 
     Returns (p1_calibrated, p2_calibrated).
     """
     if target_p1_prob <= 0.01 or target_p1_prob >= 0.99:
         return p1_serve, p2_serve
 
-    sets_to_win = 2 if best_of == 3 else 3
+    if state is not None:
+        # Calibrate at current score position
+        def model_p1(delta: float) -> float:
+            p1 = max(0.35, min(0.80, p1_serve + delta))
+            p2 = max(0.35, min(0.80, p2_serve - delta))
+            return _bare_match_prob_p1(p1, p2, state)
+    else:
+        # Calibrate at 0-0, 0-0 (legacy / opening-only)
+        sets_to_win = 2 if best_of == 3 else 3
 
-    def model_p1(delta: float) -> float:
-        p1 = max(0.35, min(0.80, p1_serve + delta))
-        p2 = max(0.35, min(0.80, p2_serve - delta))
-        # Match probability from 0-0, 0-0 with P1 serving first
-        return prob_win_match(round(p1, 4), round(p2, 4), 0, 0, sets_to_win)
+        def model_p1(delta: float) -> float:
+            p1 = max(0.35, min(0.80, p1_serve + delta))
+            p2 = max(0.35, min(0.80, p2_serve - delta))
+            return prob_win_match(round(p1, 4), round(p2, 4), 0, 0, sets_to_win)
 
     # Binary search on delta
     lo, hi = -0.20, 0.20
@@ -449,16 +532,31 @@ def calculate_model_odds(state: ScoreState) -> tuple[float, float]:
     p2_serve_raw = opponent_adjusted_serve_pct(
         state.player2_serve_pct, state.player1_return_pct, state.surface)
 
-    # Step 2: Calibrate serve %s against book odds / Elo prior
-    # This shifts the model inputs so that at 0-0 0-0, the model produces
-    # the same probability as the bookmaker. Quality gaps are now baked in.
-    prior = get_prior_p1_prob(
-        state.opening_book_odds, state.player1_elo, state.player2_elo)
-    if prior is not None:
-        p1_base, p2_base = calibrate_serve_pcts(
-            p1_serve_raw, p2_serve_raw, prior, state.best_of)
+    # Step 2: Calibrate serve %s against book odds
+    # Prefer LIVE book odds (re-calibrate at current score) over opening-only.
+    # This keeps the model anchored to reality as the match progresses,
+    # while still repricing faster than the book after score changes.
+    live_p1, live_p2 = state.live_book_odds
+    if live_p1 > 1.0 and live_p2 > 1.0:
+        # Live odds available — calibrate at current score position
+        raw_p1 = book_odds_to_prob(live_p1)
+        raw_p2 = book_odds_to_prob(live_p2)
+        total = raw_p1 + raw_p2
+        live_prior = raw_p1 / total if total > 0 else None
+        if live_prior is not None:
+            p1_base, p2_base = calibrate_serve_pcts(
+                p1_serve_raw, p2_serve_raw, live_prior, state=state)
+        else:
+            p1_base, p2_base = p1_serve_raw, p2_serve_raw
     else:
-        p1_base, p2_base = p1_serve_raw, p2_serve_raw
+        # No live odds — fall back to opening book / Elo at 0-0
+        prior = get_prior_p1_prob(
+            state.opening_book_odds, state.player1_elo, state.player2_elo)
+        if prior is not None:
+            p1_base, p2_base = calibrate_serve_pcts(
+                p1_serve_raw, p2_serve_raw, prior, best_of=state.best_of)
+        else:
+            p1_base, p2_base = p1_serve_raw, p2_serve_raw
 
     # Step 3: In-match adjustments (holds/breaks/aces + momentum)
     # These adjust RELATIVE to the calibrated baseline

@@ -251,6 +251,14 @@ class Bot:
                 if market is None:
                     continue
                 score = self.engine._find_score(market_id, self.goalserve.scores)
+                # Set live book odds for re-calibration
+                if score and score.player1_selection_id:
+                    r1 = market.runners.get(score.player1_selection_id)
+                    r2 = market.runners.get(score.player2_selection_id) if score.player2_selection_id else None
+                    score.live_book_odds = (
+                        r1.best_back_price if r1 else 0.0,
+                        r2.best_back_price if r2 else 0.0,
+                    )
                 try:
                     await self.engine._check_exit(market_id, market, score)
                 except Exception as e:

@@ -83,6 +83,8 @@ class ScoreState:
     player2_bp_saved: int = 0
     # Opening book odds captured on first sighting (baseline prior)
     opening_book_odds: tuple[float, float] = (0.0, 0.0)  # (p1_odds, p2_odds)
+    # Live book odds updated every poll (for continuous re-calibration)
+    live_book_odds: tuple[float, float] = (0.0, 0.0)  # (p1_odds, p2_odds)
     # Elo ratings (surface-specific)
     player1_elo: float = 0.0
     player2_elo: float = 0.0
